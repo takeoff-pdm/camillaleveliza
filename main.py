@@ -1,88 +1,133 @@
-import time
 import json
+import time
 from websocket import create_connection
-
-from loudness_tracker import LoudnessTracker
 
 # Websocket server configuration
 CAMILLADSP_ADRESS = "ws://0.0.0.0:1234"
 
 # Channel configuration
-K_WEIGHTED_CHANNEL_NUMBER = 0   # The channel number that represents the K-weighted signal for loudness measurement
-SUB_BASS_CHANNEL_NUMBER = 1     # The channel number that represents the sub-bass signal for breakdown detection
+K_WEIGHTED_CHANNEL_NUMBER = (
+    0  # The channel number representing the K-weighted signal
+)
 
-# Configuration Parameters
-TARGET_LUFS = -14.0             # Perceived loudness setpoint
-SILENCE_FLOOR_DB = -40.0        # Gate threshold to freeze gain on silence beneath target loudness
-BREAKDOWN_SUB_DROP_DB = -10.0   # Dropping sub energy threshold for breakdown freeze
+# Safety boundaries & constants
+MAX_BOOST_DB = 6.0  # Hard safety ceiling (positive)
+MAX_CUT_DB = 24.0  # Hard safety floor (positive)
+SILENCE_FLOOR_DB = -60.0  # Gate threshold for absolute silence
+MAX_DECREASE_DB_PER_SEC = 1.5  # Standard pull-down speed for spikes
+POLL_INTERVAL_SEC = 0.1  # Polling frequency (100ms)
+EMERGENCY_THRESHOLD_DB = 4.0  # Threshold for emergency response to sudden spikes
 
-MAX_BOOST_DB = 6.0              # Hard safety ceiling
-MAX_CUT_DB = -20.0              # Hard safety floor
+# CamillaDSP Config Paths for Dynamic Parameters
+# (These paths point to dummy filter parameters or custom gain blocks in your CamillaDSP YAML config)
+PATH_TARGET_LUFS = "/filters/leveliza_target/parameters/gain"
+PATH_TAU_SEC = "/filters/leveliza_tau/parameters/gain"
+PATH_GAIN_OUTPUT = "/filters/leveliza_gain/parameters/gain"
 
-# Time Constants (in seconds)
-ATTACK_TIME_SEC = 8.0           # Time to glide volume down
-RELEASE_TIME_SEC = 20.0         # Time to glide volume up
-POLL_INTERVAL_SEC = 0.1         # Polling frequency
-SHORT_WINDOW_SEC = 2.0          # Short-term loudness window
-LONG_WINDOW_SEC = 20.0          # Long-term loudness window
+# --- Leveliza State Variables ---
+current_gain_db = 0.0
+integrated_loudness = -14.0  # Running macro tracking anchor
+last_fetched_target = -14.0
+last_fetched_tau = 60.0
 
-
-ws = create_connection(CAMILLADSP_ADRESS)
-
-lufs_tracker = LoudnessTracker(poll_interval_sec=POLL_INTERVAL_SEC, short_window_sec=SHORT_WINDOW_SEC, long_window_sec=LONG_WINDOW_SEC)
-sub_bass_tracker = LoudnessTracker(poll_interval_sec=POLL_INTERVAL_SEC, short_window_sec=SHORT_WINDOW_SEC, long_window_sec=LONG_WINDOW_SEC)
 
 def send_command(command_dict):
-    """Sends a JSON command to CamillaDSP and returns the parsed response."""
-    ws.send(json.dumps(command_dict))
-    response = ws.recv()
-    return json.loads(response)
+  """Sends a JSON command to CamillaDSP and returns the parsed response."""
+  ws.send(json.dumps(command_dict))
+  response = ws.recv()
+  return json.loads(response)
+
+
+def get_config_value(path, default_value):
+  """Fetches a dynamic parameter value from CamillaDSP configuration."""
+  try:
+    res = send_command({"GetConfigValue": path})
+    if "value" in res:
+      return float(res["value"])
+  except Exception:
+    pass
+  return default_value
+
 
 def set_gain(gain_db):
-    """Updates the filter parameter dynamically."""
-    # CamillaDSP config value update command structure
-    cmd = {
-        "SetConfigValue": {
-            "path": "/filters/leveliza_gain/parameters/gain",
-            "value": gain_db
-        }
-    }
-    return send_command(cmd)
+  """Updates the output gain parameter dynamically in CamillaDSP."""
+  cmd = {"SetConfigValue": {"path": PATH_GAIN_OUTPUT, "value": gain_db}}
+  return send_command(cmd)
 
-# Main Loop Example
-current_gain = 0.0
+
+# Establish WebSocket connection
+ws = create_connection(CAMILLADSP_ADRESS)
 
 while True:
     try:
-        # Request signal levels from CamillaDSP
-        # GetSignalLevels returns a JSON structure containing playback_rms, etc.
+        # 1. Fetch dynamic control values from CamillaDSP on the fly
+        target_lufs = get_config_value(PATH_TARGET_LUFS, last_fetched_target)
+        tau_sec = get_config_value(PATH_TAU_SEC, last_fetched_tau)
+        last_fetched_target = target_lufs
+        last_fetched_tau = max(
+            1.0, tau_sec
+        )  # Prevent division by zero or negative tau
+
+        # Derive max increase speed dynamically based on Tau (Assertiveness)
+        # Leveliza rule: ~90 seconds to recover 10dB at default slow tau (60s).
+        # Scaling factor keeps recovery proportional to the chosen assertiveness speed.
+        max_increase_db_per_sec = max(
+            0.01, 6.6 / last_fetched_tau
+        )  # Scales speed cleanly with tau
+
+        # 2. Request signal levels from CamillaDSP
         res = send_command({"GetSignalLevels": None})
-        
+
         if "value" in res and "playback_rms" in res["value"]:
             rms_data = res["value"]["playback_rms"]
-            
-            # Extract levels for the specified channels
             k_weighted_level = rms_data[K_WEIGHTED_CHANNEL_NUMBER]
-            sub_bass_level = rms_data[SUB_BASS_CHANNEL_NUMBER]
 
-            # Check for silence or breakdown conditions
+            # 3. Silence Floor Gate: Prevent boosting noise floors
             if k_weighted_level < SILENCE_FLOOR_DB:
                 print("Silence detected. Freezing gain adjustment.")
-                continue  # Skip gain adjustment
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
-            # Check for breakdown condition based on sub-bass energy
-            long_bass_loudness, long_bass_loudness= sub_bass_tracker.update(sub_bass_level)
+            # 4. Leveliza Macro-Integration with Dynamic Tau
+            # Recalculate alpha on the fly if the user changes the tau/assertiveness slider
+            alpha = POLL_INTERVAL_SEC / (last_fetched_tau + POLL_INTERVAL_SEC)
+            integrated_loudness = (
+                1 - alpha
+            ) * integrated_loudness + alpha * k_weighted_level
 
+            # 5. Calculate Error relative to the dynamic Target LUFS
+            error = target_lufs - integrated_loudness
 
+            # 6. Asymmetrical Slew-Rate Limiting
+            max_decrease_step = MAX_DECREASE_DB_PER_SEC * POLL_INTERVAL_SEC
+            max_increase_step = max_increase_db_per_sec * POLL_INTERVAL_SEC
 
-            # Update loudness tracker with K-weighted level
-            short_lufs, long_lufs = lufs_tracker.update(k_weighted_level)
-            
-            
-            # Calculate gain adjustment based on K-weighted level
+            # Emergency Response for sudden volume leaps
+            instant_error = target_lufs - k_weighted_level
+            if instant_error < -EMERGENCY_THRESHOLD_DB:
+                effective_decrease_step = max_decrease_step * 3.0
+            else:
+                effective_decrease_step = max_decrease_step
+
+            # Apply speed limits
+            if error < 0:
+                step = max(error, -effective_decrease_step)  # Smooth attenuation
+            else:
+                step = min(
+                    error, max_increase_step
+                )  # Glacial recovery governed by dynamic tau
+
+            # 7. Update Gain State and Enforce Safety Boundaries
+            current_gain_db += step
+            current_gain_db = max(
+                -MAX_CUT_DB, min(MAX_BOOST_DB, current_gain_db)
+            )
+
+            # 8. Send updated gain to CamillaDSP
+            set_gain(current_gain_db)
 
     except Exception as e:
         print(f"WebSocket communication error: {e}")
-        break
+        time.sleep(1)  # Wait a bit before retrying to avoid spamming the server
 
     time.sleep(POLL_INTERVAL_SEC)
