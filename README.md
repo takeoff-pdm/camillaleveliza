@@ -1,7 +1,4 @@
 # camillaleveliza
-Leveliza algorithm built for CamillaDSP by HEEnquist
-
-# What does it do
 CamillaDSP Live Leveliza
 A hardware-inspired, RC Audio Leveliza-style automated loudness leveler built in Python for real-time electronic music and live DSP environments via CamillaDSP WebSockets.
 
