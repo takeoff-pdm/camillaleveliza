@@ -1,5 +1,4 @@
 # camillaleveliza
-CamillaDSP Live Leveliza
 A hardware-inspired, RC Audio Leveliza-style automated loudness leveler built in Python for real-time electronic music and live DSP environments via CamillaDSP WebSockets.
 
 Unlike standard compressors that pump and distort on heavy sub-bass breakdowns, this script mimics analog electronic physics to maintain rock-solid perceived loudness across varying track arrangements without altering transient punch.
